@@ -91,7 +91,21 @@ def webhook_post():
         key = msg.get("key", {}) or {}
         from_me = bool(key.get("fromMe"))
         text = extract_text(msg) or ""
-        app.logger.info("Debug texto extraído: %r", text)
+
+        # Fallback: tenta direto no envelope do Evolution (data.message)
+        if not text and isinstance(payload.get("data"), dict):
+            dm = payload["data"].get("message") or {}
+            if isinstance(dm, dict):
+                text = (
+                    dm.get("conversation")
+                    or (dm.get("extendedTextMessage") or {}).get("text")
+                    or (dm.get("imageMessage") or {}).get("caption")
+                    or (dm.get("videoMessage") or {}).get("caption")
+                    or (dm.get("documentMessage") or {}).get("caption")
+                    or ""
+                )
+
+        app.logger.info("Debug texto extraído (c/ fallback): %r", text)
 
         # ignora mensagens do próprio bot, a menos que SELF_TEST esteja ativado
         if from_me:
