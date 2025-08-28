@@ -4,7 +4,8 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from funcoes import (
     extract_text, extract_number, route_builtin, enviar_texto, only_digits,
-    gerar_resposta_llm_com_contexto, salvar_mensagem, carregar_contexto
+    gerar_resposta_llm_com_contexto, salvar_mensagem, carregar_contexto,
+    precisa_handoff, resumir_conversa_para_humano, notificar_dono
 )
 
 load_dotenv()
@@ -55,9 +56,13 @@ def webhook_post():
 
     for msg in messages:
         key = (msg or {}).get("key", {}) or {}
-        from_me = bool(key.get("fromMe"))
+        _raw_from_me = key.get("fromMe")
+        if isinstance(_raw_from_me, bool):
+            from_me = _raw_from_me
+        else:
+            from_me = str(_raw_from_me).strip().lower() == "true"
 
-        # número/remetente
+        # número e jid
         remote, number = extract_number(msg, payload, MY_NUMBER, from_me)
 
         # ignorar grupos
@@ -65,33 +70,28 @@ def webhook_post():
             app.logger.info("Ignorando grupo: %s", remote)
             continue
 
-        # SELF_TEST estrito: só processa mensagens que você realmente enviou para você mesmo
+        # SELF_TEST estrito
         if SELF_TEST == "1":
             if not (from_me and number == only_digits(MY_NUMBER)):
                 app.logger.info("SELF_TEST: ignorando (from_me=%s, number=%s, my=%s, remote=%s)",
                                 from_me, number, only_digits(MY_NUMBER), remote)
                 continue
 
-
+        # texto
         text = (extract_text(msg, payload) or "").strip()
-
-        # número/remetente
-        remote, number = extract_number(msg, payload, MY_NUMBER, from_me)
-        if isinstance(remote, str) and remote.endswith("@g.us"):
-            app.logger.info("Ignorando grupo: %s", remote)
+        if not text:
             continue
 
-        # --- persistir mensagem do usuário
-        if text:
-            try:
-                salvar_mensagem(number, "user", text)
-            except Exception as e:
-                app.logger.exception("Erro ao salvar mensagem do usuário: %s", e)
+        # salvar entrada do usuário
+        try:
+            salvar_mensagem(number, "user", text)
+        except Exception as e:
+            app.logger.exception("Erro ao salvar mensagem do usuário: %s", e)
 
-        # roteamento: comandos built-in primeiro
+        # roteamento inicial
         reply = route_builtin(text)
 
-        # LLM com contexto: /ai <texto> → envia últimas 25 mensagens do número
+        # LLM com contexto
         llm_reply = None
         if reply is None:
             tl = text.lower()
@@ -112,25 +112,20 @@ def webhook_post():
                         app.logger.exception("Erro LLM com contexto: %s", e)
                         reply = "Não consegui consultar a LLM agora."
             else:
-                # fallback simples
                 reply = f"Você disse: {text}"
 
-        # --- Roteamento (handoff) ---
+        # handoff inteligente
         try:
-            from funcoes import precisa_handoff, resumir_conversa_para_humano, notificar_dono
             handoff, motivo = precisa_handoff(text, llm_reply or reply)
             if handoff and MY_NUMBER:
-                # 1) avisa o usuário
                 aviso_user = ("Vou te transferir para um atendente humano para te ajudar melhor. "
-                            "Acabei de enviar um resumo da conversa. 👍")
+                              "Acabei de enviar um resumo da conversa. 👍")
                 prefix = "[bot] " if from_me else ""
                 enviar_texto(EV_BASE, EV_KEY, EV_INST, number, prefix + aviso_user)
 
-                # 2) monta o resumo e envia ao dono
                 resumo = resumir_conversa_para_humano(number, carregar_contexto, limite=25)
                 notificar_dono(EV_BASE, EV_KEY, EV_INST, MY_NUMBER, number, resumo)
 
-                # 3) encerra a rodada sem mandar a resposta LLM (ou pode mandar junto, se quiser)
                 replies.append({"to": number, "status": "handoff"})
                 try:
                     salvar_mensagem(number, "assistant", "[handoff] " + aviso_user)
@@ -140,8 +135,7 @@ def webhook_post():
         except Exception as e:
             app.logger.exception("Falha no roteamento/handoff: %s", e)
 
-
-        # prefixo anti-loop para mensagens enviadas por você
+        # enviar resposta
         prefix = "[bot] " if from_me else ""
         try:
             r = enviar_texto(EV_BASE, EV_KEY, EV_INST, number, prefix + reply)
@@ -150,7 +144,7 @@ def webhook_post():
             app.logger.exception("Falha ao enviar reply: %s", e)
             replies.append({"to": number, "status": "error"})
 
-        # --- persistir mensagem do bot
+        # salvar resposta
         try:
             salvar_mensagem(number, "assistant", prefix + reply)
         except Exception as e:
