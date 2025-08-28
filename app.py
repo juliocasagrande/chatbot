@@ -92,6 +92,11 @@ def webhook_post():
         from_me = bool(key.get("fromMe"))
         text = extract_text(msg) or ""
 
+        # modo self-test estrito: só processa mensagens enviadas por você
+        if SELF_TEST == "1" and not from_me:
+            app.logger.info("SELF_TEST ativo: ignorando mensagem de terceiros.")
+            continue
+
         # Fallback: tenta direto no envelope do Evolution (data.message)
         if not text and isinstance(payload.get("data"), dict):
             dm = payload["data"].get("message") or {}
