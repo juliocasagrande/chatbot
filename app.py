@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from funcoes import (
     extract_text, extract_number, route_builtin, enviar_texto, only_digits,
     gerar_resposta_llm_com_contexto, salvar_mensagem, carregar_contexto,
-    precisa_handoff, resumir_conversa_para_humano, notificar_dono
+    precisa_handoff, resumir_conversa_para_humano, notificar_dono, marcar_handoff
 )
 
 load_dotenv()
@@ -46,8 +46,7 @@ def webhook_post():
     elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("messages"), list):
         messages = payload["data"]["messages"]
     elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("message"), dict):
-        # Neste caso o 'key' NÃO vem dentro do message; vem em data.key
-        # Mantemos msg = data.message e buscamos key do envelope mais abaixo
+        # quando vem nesse formato, o 'key' costuma estar em data.key
         messages = [payload["data"]["message"]]
     elif isinstance(payload.get("data"), dict):
         d = payload["data"]
@@ -58,8 +57,7 @@ def webhook_post():
 
     for msg in messages:
         data_env = payload.get("data") or {}
-
-        # 🔑 Pega key do próprio msg OU do envelope (data.key)
+        # key pode estar em msg.key OU no envelope data.key
         key = (msg or {}).get("key") or (data_env.get("key") or {})
 
         # fromMe pode vir bool ou string
@@ -69,7 +67,7 @@ def webhook_post():
         else:
             from_me = str(_raw_from_me).strip().lower() == "true"
 
-        # número/JID (função já tem fallbacks, mas agora passamos o from_me correto)
+        # número / JID
         remote, number = extract_number(msg, payload, MY_NUMBER, from_me)
 
         # ignora grupos
@@ -80,15 +78,17 @@ def webhook_post():
         # SELF_TEST estrito: só processa msg que VOCÊ enviou para VOCÊ mesmo
         if SELF_TEST == "1":
             if not (from_me and number == only_digits(MY_NUMBER)):
-                app.logger.info("SELF_TEST: ignorando (from_me=%s, number=%s, my=%s, remote=%s)",
-                                from_me, number, only_digits(MY_NUMBER), remote)
+                app.logger.info(
+                    "SELF_TEST: ignorando (from_me=%s, number=%s, my=%s, remote=%s)",
+                    from_me, number, only_digits(MY_NUMBER), remote
+                )
                 continue
 
         text = (extract_text(msg, payload) or "").strip()
         if not text:
             continue
 
-        # salva entrada do usuário
+        # salvar entrada do usuário
         try:
             salvar_mensagem(number, "user", text)
         except Exception as e:
@@ -107,7 +107,7 @@ def webhook_post():
                     reply = "Use assim: /ai sua pergunta aqui."
                 else:
                     try:
-                        ctx = carregar_contexto(number, limite=25)
+                        ctx = carregar_contexto(number, limite=10)
                         ctx.append({"role": "user", "content": prompt})
                         llm_reply = gerar_resposta_llm_com_contexto(
                             ctx,
@@ -120,19 +120,33 @@ def webhook_post():
             else:
                 reply = f"Você disse: {text}"
 
-        # handoff inteligente
+        # -------- Handoff inteligente (com mínimos e cooldown) --------
         try:
-            handoff, motivo = precisa_handoff(text, llm_reply or reply)
-            if handoff and MY_NUMBER:
-                aviso_user = ("Vou te transferir para um atendente humano para te ajudar melhor. "
-                              "Acabei de enviar um resumo da conversa. 👍")
+            # tamanho do contexto atual (últimas 10)
+            ctx_len = 0
+            try:
+                ctx_tmp = carregar_contexto(number, limite=10)
+                ctx_len = len(ctx_tmp)
+            except Exception:
+                pass
+
+            handoff, motivo = precisa_handoff(text, llm_reply or reply, ctx_len)
+
+            OWNER_NUMBER = os.environ.get("OWNER_NUMBER", MY_NUMBER)
+            if handoff and OWNER_NUMBER:
+                aviso_user = (
+                    "Vou te transferir para um atendente humano para te ajudar melhor. "
+                    "Acabei de enviar um resumo da conversa. 👍"
+                )
                 prefix = "[bot] " if from_me else ""
                 enviar_texto(EV_BASE, EV_KEY, EV_INST, number, prefix + aviso_user)
 
-                resumo = resumir_conversa_para_humano(number, carregar_contexto, limite=25)
-                notificar_dono(EV_BASE, EV_KEY, EV_INST, MY_NUMBER, number, resumo)
+                resumo = resumir_conversa_para_humano(number, carregar_contexto, limite=10)
+                notificar_dono(EV_BASE, EV_KEY, EV_INST, OWNER_NUMBER, number, resumo)
 
-                replies.append({"to": number, "status": "handoff"})
+                marcar_handoff(number)  # inicia cooldown
+
+                replies.append({"to": number, "status": "handoff", "reason": motivo})
                 try:
                     salvar_mensagem(number, "assistant", "[handoff] " + aviso_user)
                 except Exception as e:
@@ -140,6 +154,7 @@ def webhook_post():
                 return jsonify({"ok": True, "got": len(messages), "replied": replies}), 200
         except Exception as e:
             app.logger.exception("Falha no roteamento/handoff: %s", e)
+        # --------------------------------------------------------------
 
         # enviar resposta
         prefix = "[bot] " if from_me else ""
@@ -150,7 +165,7 @@ def webhook_post():
             app.logger.exception("Falha ao enviar reply: %s", e)
             replies.append({"to": number, "status": "error"})
 
-        # salva resposta
+        # salvar resposta do bot
         try:
             salvar_mensagem(number, "assistant", prefix + reply)
         except Exception as e:

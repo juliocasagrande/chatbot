@@ -6,12 +6,14 @@
 # 3) Evolution (envio de mensagem)
 # 4) Banco de Dados (persistência do histórico)
 # 5) LLM (Groq) - resposta simples e com contexto
+# 6) Roteamento / Handoff (heurística + resumo + notificação)
 # =========================
 
 # 1) Imports e logging ----------------------
 import os
 import re
 import json
+import time
 import datetime
 import logging
 from typing import List, Dict, Tuple, Optional
@@ -248,9 +250,12 @@ def gerar_resposta_llm_com_contexto(mensagens: List[Dict[str, str]], system: Opt
     )
     return (resp.choices[0].message.content or "").strip()
 
-# ---------- Roteamento / Handoff para humano ----------
+# 6) Roteamento / Handoff -------------------
 
-def _kw_list_from_env(var: str, default: str) -> list[str]:
+# cooldown em memória por número
+_HANDOFF_COOLDOWN: Dict[str, float] = {}
+
+def _kw_list_from_env(var: str, default: str) -> List[str]:
     val = os.environ.get(var, "").strip()
     base = [s.strip().lower() for s in default.split("|") if s.strip()]
     if not val:
@@ -258,15 +263,35 @@ def _kw_list_from_env(var: str, default: str) -> list[str]:
     extra = [s.strip().lower() for s in val.split("|") if s.strip()]
     return list(dict.fromkeys(base + extra))  # único e na ordem
 
-def precisa_handoff(texto_usuario: str, resposta_llm: str | None) -> tuple[bool, str]:
-    """
-    Heurísticas simples para decidir se deve transferir para humano.
-    Retorna (True/False, motivo).
-    """
-    t = (texto_usuario or "").strip().lower()
-    r = (resposta_llm or "").strip().lower()
+def _cooldown_minutes() -> int:
+    try:
+        return int(os.environ.get("HANDOFF_COOLDOWN_MIN", "20"))
+    except Exception:
+        return 20
 
-    # 1) Pedido explícito do usuário
+def em_cooldown(numero: str) -> bool:
+    """Retorna True se o número ainda estiver no período de cooldown de handoff."""
+    t0 = _HANDOFF_COOLDOWN.get(numero, 0.0)
+    return (time.time() - t0) < (_cooldown_minutes() * 60)
+
+def marcar_handoff(numero: str) -> None:
+    """Marca/inicia a janela de cooldown para este número."""
+    _HANDOFF_COOLDOWN[numero] = time.time()
+
+def precisa_handoff(
+    texto_usuario: str,
+    resposta_llm: Optional[str],
+    ctx_len: int
+) -> Tuple[bool, str]:
+    """
+    Decide se deve escalar. Retorna (True/False, motivo).
+    Regras:
+      - Sempre permite handoff por palavra‑chave explícita do usuário.
+      - Auto‑handoff só ocorre se HANDOFF_AUTO=1 **e** houver contexto suficiente.
+      - Não verifica cooldown aqui (opcional checar via em_cooldown() no app).
+    """
+    # 1) pedido explícito do usuário
+    t = (texto_usuario or "").strip().lower()
     kws = _kw_list_from_env(
         "ESCALATION_KEYWORDS",
         "humano|atendente|suporte|falar com alguém|transferir|pessoa|representante"
@@ -274,44 +299,52 @@ def precisa_handoff(texto_usuario: str, resposta_llm: str | None) -> tuple[bool,
     if any(kw in t for kw in kws):
         return True, "pedido_explicitamente_pelo_usuario"
 
-    # 2) Sinais de baixa confiança / incapacidade
+    # 2) auto-handoff desligado?
+    if os.environ.get("HANDOFF_AUTO", "0") != "1":
+        return False, "auto_handoff_desligado"
+
+    # 3) pouco contexto?
+    try:
+        min_turns = int(os.environ.get("HANDOFF_MIN_TURNS", "6"))
+    except Exception:
+        min_turns = 6
+    if ctx_len < min_turns:
+        return False, "pouco_contexto"
+
+    # 4) heurística simples de baixa confiança
+    r = (resposta_llm or "").strip().lower()
     low_conf_signals = (
         "não consigo", "não tenho acesso", "não tenho certeza",
         "desculpe", "não sei", "não entendi", "não está claro",
-        "não posso ajudar", "fora do meu escopo"
+        "não posso ajudar", "fora do meu escopo", "não tenho memória",
+        "conversa nova"
     )
-    if r:
-        # resposta muito curta e genérica
-        if len(r) < 10 and any(x in r for x in ("não", "desculpe", "ops")):
-            return True, "resposta_muito_curta_e_indefinida"
-        # contém sinais de baixa confiança
-        if any(sig in r for sig in low_conf_signals):
-            return True, "baixa_confianca_llm"
+
+    # resposta muito curta e negativa
+    if len(r) < 12 and any(x in r for x in ("não", "desculpe")):
+        return True, "resposta_muito_curta_e_negativa"
+
+    # sinais fortes de incapacidade
+    if any(sig in r for sig in low_conf_signals):
+        return True, "baixa_confianca_llm"
 
     return False, ""
 
 def resumir_conversa_para_humano(numero: str, carregar_ctx_fn, limite: int = 25) -> str:
-    """
-    Gera um resumo objetivo para o humano com base no histórico.
-    """
+    """Gera um resumo objetivo para o humano com base no histórico."""
     mensagens = carregar_ctx_fn(numero, limite=limite)
     if not mensagens:
         return f"Sem histórico para {numero}."
-
-    # prompt de resumo
     system = (
         "Você é um assistente que resume uma conversa de WhatsApp para um humano assumir o atendimento. "
         "Produza um resumo curto (5-8 linhas), com: objetivo do usuário, fatos já coletados, "
         "tentativas do bot, pendências e próxima ação sugerida."
     )
-    resumo = gerar_resposta_llm_com_contexto(mensagens, system=system)
-    return resumo
+    return gerar_resposta_llm_com_contexto(mensagens, system=system)
 
 def notificar_dono(ev_base: str, ev_key: str, ev_inst: str,
                    owner_number: str, numero_usuario: str, resumo: str) -> None:
-    """
-    Envia o resumo para o dono (humano).
-    """
+    """Envia o resumo para o dono (humano)."""
     cabecalho = (f"[Escalação automática]\n"
                  f"Usuário: {numero_usuario}\n"
                  f"Resumo da conversa:\n\n{resumo}\n\n"
