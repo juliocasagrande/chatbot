@@ -91,6 +91,7 @@ def webhook_post():
         key = msg.get("key", {}) or {}
         from_me = bool(key.get("fromMe"))
         text = extract_text(msg) or ""
+        app.logger.info("Debug texto extraído: %r", text)
 
         # ignora mensagens do próprio bot, a menos que SELF_TEST esteja ativado
         if from_me:
