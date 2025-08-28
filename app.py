@@ -57,15 +57,21 @@ def webhook_post():
         key = (msg or {}).get("key", {}) or {}
         from_me = bool(key.get("fromMe"))
 
-        # SELF_TEST estrito: só processa mensagens suas; alguns eventos vêm com fromMe=false,
-        # então aceitamos também quando o sender do envelope é o seu JID
-        if SELF_TEST == "1" and not from_me:
-            sender_jid = ""
-            if isinstance(payload, dict):
-                sender_jid = str(payload.get("sender") or "")
-            if only_digits(sender_jid) != only_digits(MY_NUMBER):
-                app.logger.info("SELF_TEST ativo: ignorando mensagem de terceiros.")
+        # número/remetente
+        remote, number = extract_number(msg, payload, MY_NUMBER, from_me)
+
+        # ignorar grupos
+        if isinstance(remote, str) and remote.endswith("@g.us"):
+            app.logger.info("Ignorando grupo: %s", remote)
+            continue
+
+        # SELF_TEST estrito: só processa mensagens que você realmente enviou para você mesmo
+        if SELF_TEST == "1":
+            if not (from_me and number == only_digits(MY_NUMBER)):
+                app.logger.info("SELF_TEST: ignorando (from_me=%s, number=%s, my=%s, remote=%s)",
+                                from_me, number, only_digits(MY_NUMBER), remote)
                 continue
+
 
         text = (extract_text(msg, payload) or "").strip()
 
@@ -73,9 +79,6 @@ def webhook_post():
         remote, number = extract_number(msg, payload, MY_NUMBER, from_me)
         if isinstance(remote, str) and remote.endswith("@g.us"):
             app.logger.info("Ignorando grupo: %s", remote)
-            continue
-        if MY_NUMBER and number != only_digits(MY_NUMBER):
-            app.logger.info("Ignorando %s (não é MY_NUMBER)", number)
             continue
 
         # --- persistir mensagem do usuário
@@ -89,6 +92,7 @@ def webhook_post():
         reply = route_builtin(text)
 
         # LLM com contexto: /ai <texto> → envia últimas 25 mensagens do número
+        llm_reply = None
         if reply is None:
             tl = text.lower()
             if tl.startswith("/ai "):
@@ -99,16 +103,43 @@ def webhook_post():
                     try:
                         ctx = carregar_contexto(number, limite=25)
                         ctx.append({"role": "user", "content": prompt})
-                        reply = gerar_resposta_llm_com_contexto(
+                        llm_reply = gerar_resposta_llm_com_contexto(
                             ctx,
                             system="Você é um assistente do WhatsApp útil, objetivo e em PT‑BR."
                         )
+                        reply = llm_reply
                     except Exception as e:
                         app.logger.exception("Erro LLM com contexto: %s", e)
                         reply = "Não consegui consultar a LLM agora."
             else:
                 # fallback simples
                 reply = f"Você disse: {text}"
+
+        # --- Roteamento (handoff) ---
+        try:
+            from funcoes import precisa_handoff, resumir_conversa_para_humano, notificar_dono
+            handoff, motivo = precisa_handoff(text, llm_reply or reply)
+            if handoff and MY_NUMBER:
+                # 1) avisa o usuário
+                aviso_user = ("Vou te transferir para um atendente humano para te ajudar melhor. "
+                            "Acabei de enviar um resumo da conversa. 👍")
+                prefix = "[bot] " if from_me else ""
+                enviar_texto(EV_BASE, EV_KEY, EV_INST, number, prefix + aviso_user)
+
+                # 2) monta o resumo e envia ao dono
+                resumo = resumir_conversa_para_humano(number, carregar_contexto, limite=25)
+                notificar_dono(EV_BASE, EV_KEY, EV_INST, MY_NUMBER, number, resumo)
+
+                # 3) encerra a rodada sem mandar a resposta LLM (ou pode mandar junto, se quiser)
+                replies.append({"to": number, "status": "handoff"})
+                try:
+                    salvar_mensagem(number, "assistant", "[handoff] " + aviso_user)
+                except Exception as e:
+                    app.logger.exception("Erro ao salvar aviso de handoff: %s", e)
+                return jsonify({"ok": True, "got": len(messages), "replied": replies}), 200
+        except Exception as e:
+            app.logger.exception("Falha no roteamento/handoff: %s", e)
+
 
         # prefixo anti-loop para mensagens enviadas por você
         prefix = "[bot] " if from_me else ""

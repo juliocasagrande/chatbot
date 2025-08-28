@@ -247,3 +247,76 @@ def gerar_resposta_llm_com_contexto(mensagens: List[Dict[str, str]], system: Opt
         stream=False,
     )
     return (resp.choices[0].message.content or "").strip()
+
+# ---------- Roteamento / Handoff para humano ----------
+
+def _kw_list_from_env(var: str, default: str) -> list[str]:
+    val = os.environ.get(var, "").strip()
+    base = [s.strip().lower() for s in default.split("|") if s.strip()]
+    if not val:
+        return base
+    extra = [s.strip().lower() for s in val.split("|") if s.strip()]
+    return list(dict.fromkeys(base + extra))  # único e na ordem
+
+def precisa_handoff(texto_usuario: str, resposta_llm: str | None) -> tuple[bool, str]:
+    """
+    Heurísticas simples para decidir se deve transferir para humano.
+    Retorna (True/False, motivo).
+    """
+    t = (texto_usuario or "").strip().lower()
+    r = (resposta_llm or "").strip().lower()
+
+    # 1) Pedido explícito do usuário
+    kws = _kw_list_from_env(
+        "ESCALATION_KEYWORDS",
+        "humano|atendente|suporte|falar com alguém|transferir|pessoa|representante"
+    )
+    if any(kw in t for kw in kws):
+        return True, "pedido_explicitamente_pelo_usuario"
+
+    # 2) Sinais de baixa confiança / incapacidade
+    low_conf_signals = (
+        "não consigo", "não tenho acesso", "não tenho certeza",
+        "desculpe", "não sei", "não entendi", "não está claro",
+        "não posso ajudar", "fora do meu escopo"
+    )
+    if r:
+        # resposta muito curta e genérica
+        if len(r) < 10 and any(x in r for x in ("não", "desculpe", "ops")):
+            return True, "resposta_muito_curta_e_indefinida"
+        # contém sinais de baixa confiança
+        if any(sig in r for sig in low_conf_signals):
+            return True, "baixa_confianca_llm"
+
+    return False, ""
+
+def resumir_conversa_para_humano(numero: str, carregar_ctx_fn, limite: int = 25) -> str:
+    """
+    Gera um resumo objetivo para o humano com base no histórico.
+    """
+    mensagens = carregar_ctx_fn(numero, limite=limite)
+    if not mensagens:
+        return f"Sem histórico para {numero}."
+
+    # prompt de resumo
+    system = (
+        "Você é um assistente que resume uma conversa de WhatsApp para um humano assumir o atendimento. "
+        "Produza um resumo curto (5-8 linhas), com: objetivo do usuário, fatos já coletados, "
+        "tentativas do bot, pendências e próxima ação sugerida."
+    )
+    resumo = gerar_resposta_llm_com_contexto(mensagens, system=system)
+    return resumo
+
+def notificar_dono(ev_base: str, ev_key: str, ev_inst: str,
+                   owner_number: str, numero_usuario: str, resumo: str) -> None:
+    """
+    Envia o resumo para o dono (humano).
+    """
+    cabecalho = (f"[Escalação automática]\n"
+                 f"Usuário: {numero_usuario}\n"
+                 f"Resumo da conversa:\n\n{resumo}\n\n"
+                 f"Aja respondendo diretamente ao usuário.")
+    try:
+        enviar_texto(ev_base, ev_key, ev_inst, only_digits(owner_number), cabecalho)
+    except Exception as e:
+        log.exception("Falha ao notificar dono: %s", e)
