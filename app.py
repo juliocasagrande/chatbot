@@ -96,8 +96,17 @@ def webhook_post():
         key = msg.get("key", {}) or {}
 
         # evita loop (mensagens enviadas pelo próprio bot)
-        if key.get("fromMe"):
-            continue
+        from_me = bool(key.get("fromMe"))
+        text = extract_text(msg) or ""
+
+        # modo auto-teste: só responde a mensagens "minhas" se SELF_TEST=1
+        # e nunca responde a mensagens que o próprio bot enviou (prefixadas com [bot])
+        if from_me:
+            if os.environ.get("SELF_TEST", "0") != "1":
+                continue
+            if text.strip().lower().startswith("[bot]"):
+                continue
+
 
         # tenta extrair o número do remetente
         remote = (
@@ -119,7 +128,9 @@ def webhook_post():
             continue
 
         url = f"{EV_BASE}/message/sendText/{EV_INST}"
-        body = {"number": number, "text": reply}
+        prefix = "[bot] " if from_me else ""
+        body = {"number": number, "text": prefix + reply}
+
 
         try:
             r = requests.post(url, headers=HDRS, json=body, timeout=15)
