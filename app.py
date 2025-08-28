@@ -9,7 +9,7 @@ EV_BASE = os.environ.get("EV_BASE", "").rstrip("/")
 EV_KEY  = os.environ.get("EV_KEY", "")
 EV_INST = os.environ.get("EV_INST", "")
 MY_NUMBER = os.environ.get("MY_NUMBER", "")
-SELF_TEST = os.environ.get("SELF_TEST", "0")  # "1" para responder mensagens enviadas por você mesmo
+SELF_TEST = os.environ.get("SELF_TEST", "0")
 
 HDRS = {"apikey": EV_KEY, "Content-Type": "application/json"}
 
@@ -22,29 +22,21 @@ def only_digits(s: str) -> str:
 def extract_text(msg: dict) -> str | None:
     m = msg.get("message", {}) or {}
 
-    # formatos comuns
     if "conversation" in m:
         return m["conversation"]
     if "extendedTextMessage" in m:
         return m["extendedTextMessage"].get("text")
-
-    # imagem / vídeo / doc / áudio com legenda
     for k in ("imageMessage", "videoMessage", "documentMessage", "audioMessage"):
         if k in m and m[k].get("caption"):
             return m[k]["caption"]
-
-    # alguns providers mandam em m["text"] simples
     if "text" in m and isinstance(m["text"], str):
         return m["text"]
-
-    # fallback: mensagens efêmeras
     if "ephemeralMessage" in m:
         inner = m["ephemeralMessage"].get("message", {})
         if "conversation" in inner:
             return inner["conversation"]
         if "extendedTextMessage" in inner:
             return inner["extendedTextMessage"].get("text")
-
     return None
 
 def route_reply(t: str) -> str | None:
@@ -80,8 +72,7 @@ def webhook_post():
     payload = request.get_json(silent=True) or {}
     app.logger.info("Webhook payload: %s", json.dumps(payload)[:2000])
 
-    # Estruturas comuns do Evolution:
-    # { "messages":[...] }  ou  { "data": { "messages":[...] } }  ou  { "data": { "message": {...} } }
+    # receber mensagens em diferentes formatos
     messages = []
     if isinstance(payload.get("messages"), list):
         messages = payload["messages"]
@@ -89,6 +80,10 @@ def webhook_post():
         messages = payload["data"]["messages"]
     elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("message"), dict):
         messages = [payload["data"]["message"]]
+    elif isinstance(payload.get("data"), dict):
+        d = payload["data"]
+        if isinstance(d, dict) and ("key" in d or "message" in d or "messageType" in d):
+            messages = [d]
 
     replies = []
 
@@ -97,24 +92,38 @@ def webhook_post():
         from_me = bool(key.get("fromMe"))
         text = extract_text(msg) or ""
 
-        # Modo auto-teste: responde a mensagens "minhas" se SELF_TEST=1,
-        # mas nunca responde às mensagens do próprio bot (prefixadas com [bot]).
+        # ignora mensagens do próprio bot, a menos que SELF_TEST esteja ativado
         if from_me:
             if SELF_TEST != "1":
                 continue
-            if (text or "").strip().lower().startswith("[bot]"):
+            if text.lower().startswith("[bot]"):
                 continue
 
-        # número do remetente
+        # --- extração robusta do número ---
         remote = (
             key.get("remoteJid")
-            or key.get("participant")   # em grupos
+            or key.get("participant")
             or msg.get("from")
+            or (payload.get("sender") if isinstance(payload, dict) else "")
             or ""
         )
+
+        if not remote and isinstance(payload.get("data"), dict):
+            d = payload["data"]
+            remote = d.get("sender") or d.get("from") or d.get("remoteJid") or ""
+
         number = only_digits(remote)
 
-        # responde apenas ao meu número (para este protótipo)
+        if isinstance(remote, str) and remote.endswith("@g.us"):
+            app.logger.info("Ignorando mensagem de grupo: %s", remote)
+            continue
+
+        if from_me and not number:
+            number = only_digits(MY_NUMBER)
+
+        app.logger.info("Debug número - remote: %r -> number extraído: %r ; MY_NUMBER: %r",
+                        remote, number, only_digits(MY_NUMBER))
+
         if MY_NUMBER and number != only_digits(MY_NUMBER):
             app.logger.info("Ignorando mensagem de %s (não é MY_NUMBER)", number)
             continue
@@ -123,9 +132,9 @@ def webhook_post():
         if not reply:
             continue
 
-        url = f"{EV_BASE}/message/sendText/{EV_INST}"
         prefix = "[bot] " if from_me else ""
         body = {"number": number, "text": prefix + reply}
+        url = f"{EV_BASE}/message/sendText/{EV_INST}"
 
         try:
             r = requests.post(url, headers=HDRS, json=body, timeout=15)
