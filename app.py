@@ -9,6 +9,7 @@ EV_BASE = os.environ.get("EV_BASE", "").rstrip("/")
 EV_KEY  = os.environ.get("EV_KEY", "")
 EV_INST = os.environ.get("EV_INST", "")
 MY_NUMBER = os.environ.get("MY_NUMBER", "")
+SELF_TEST = os.environ.get("SELF_TEST", "0")  # "1" para responder mensagens enviadas por você mesmo
 
 HDRS = {"apikey": EV_KEY, "Content-Type": "application/json"}
 
@@ -36,7 +37,7 @@ def extract_text(msg: dict) -> str | None:
     if "text" in m and isinstance(m["text"], str):
         return m["text"]
 
-    # fallback em estruturas tipo {"message":{"ephemeralMessage":{"message":{"conversation":...}}}}
+    # fallback: mensagens efêmeras
     if "ephemeralMessage" in m:
         inner = m["ephemeralMessage"].get("message", {})
         if "conversation" in inner:
@@ -62,7 +63,6 @@ def route_reply(t: str) -> str | None:
 
 @app.route("/", methods=["GET"])
 def health():
-    # mostrar um pouco do estado (sem vazar segredos)
     return {
         "ok": True,
         "service": "julio-bot",
@@ -80,35 +80,32 @@ def webhook_post():
     payload = request.get_json(silent=True) or {}
     app.logger.info("Webhook payload: %s", json.dumps(payload)[:2000])
 
-    # Formatos comuns: { "messages":[...] } OU { "data": { "messages":[...] } } OU { "messages":[...], "event": ... }
+    # Estruturas comuns do Evolution:
+    # { "messages":[...] }  ou  { "data": { "messages":[...] } }  ou  { "data": { "message": {...} } }
     messages = []
     if isinstance(payload.get("messages"), list):
         messages = payload["messages"]
     elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("messages"), list):
         messages = payload["data"]["messages"]
     elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("message"), dict):
-        # alguns mandam uma única mensagem em data.message
         messages = [payload["data"]["message"]]
 
     replies = []
 
     for msg in messages:
         key = msg.get("key", {}) or {}
-
-        # evita loop (mensagens enviadas pelo próprio bot)
         from_me = bool(key.get("fromMe"))
         text = extract_text(msg) or ""
 
-        # modo auto-teste: só responde a mensagens "minhas" se SELF_TEST=1
-        # e nunca responde a mensagens que o próprio bot enviou (prefixadas com [bot])
+        # Modo auto-teste: responde a mensagens "minhas" se SELF_TEST=1,
+        # mas nunca responde às mensagens do próprio bot (prefixadas com [bot]).
         if from_me:
-            if os.environ.get("SELF_TEST", "0") != "1":
+            if SELF_TEST != "1":
                 continue
-            if text.strip().lower().startswith("[bot]"):
+            if (text or "").strip().lower().startswith("[bot]"):
                 continue
 
-
-        # tenta extrair o número do remetente
+        # número do remetente
         remote = (
             key.get("remoteJid")
             or key.get("participant")   # em grupos
@@ -117,12 +114,11 @@ def webhook_post():
         )
         number = only_digits(remote)
 
-        # responde apenas para o seu número (teste "comigo mesmo")
+        # responde apenas ao meu número (para este protótipo)
         if MY_NUMBER and number != only_digits(MY_NUMBER):
             app.logger.info("Ignorando mensagem de %s (não é MY_NUMBER)", number)
             continue
 
-        text = extract_text(msg) or ""
         reply = route_reply(text)
         if not reply:
             continue
@@ -130,7 +126,6 @@ def webhook_post():
         url = f"{EV_BASE}/message/sendText/{EV_INST}"
         prefix = "[bot] " if from_me else ""
         body = {"number": number, "text": prefix + reply}
-
 
         try:
             r = requests.post(url, headers=HDRS, json=body, timeout=15)
