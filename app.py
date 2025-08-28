@@ -46,6 +46,8 @@ def webhook_post():
     elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("messages"), list):
         messages = payload["data"]["messages"]
     elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("message"), dict):
+        # Neste caso o 'key' NÃO vem dentro do message; vem em data.key
+        # Mantemos msg = data.message e buscamos key do envelope mais abaixo
         messages = [payload["data"]["message"]]
     elif isinstance(payload.get("data"), dict):
         d = payload["data"]
@@ -55,43 +57,47 @@ def webhook_post():
     replies = []
 
     for msg in messages:
-        key = (msg or {}).get("key", {}) or {}
+        data_env = payload.get("data") or {}
+
+        # 🔑 Pega key do próprio msg OU do envelope (data.key)
+        key = (msg or {}).get("key") or (data_env.get("key") or {})
+
+        # fromMe pode vir bool ou string
         _raw_from_me = key.get("fromMe")
         if isinstance(_raw_from_me, bool):
             from_me = _raw_from_me
         else:
             from_me = str(_raw_from_me).strip().lower() == "true"
 
-        # número e jid
+        # número/JID (função já tem fallbacks, mas agora passamos o from_me correto)
         remote, number = extract_number(msg, payload, MY_NUMBER, from_me)
 
-        # ignorar grupos
+        # ignora grupos
         if isinstance(remote, str) and remote.endswith("@g.us"):
             app.logger.info("Ignorando grupo: %s", remote)
             continue
 
-        # SELF_TEST estrito
+        # SELF_TEST estrito: só processa msg que VOCÊ enviou para VOCÊ mesmo
         if SELF_TEST == "1":
             if not (from_me and number == only_digits(MY_NUMBER)):
                 app.logger.info("SELF_TEST: ignorando (from_me=%s, number=%s, my=%s, remote=%s)",
                                 from_me, number, only_digits(MY_NUMBER), remote)
                 continue
 
-        # texto
         text = (extract_text(msg, payload) or "").strip()
         if not text:
             continue
 
-        # salvar entrada do usuário
+        # salva entrada do usuário
         try:
             salvar_mensagem(number, "user", text)
         except Exception as e:
             app.logger.exception("Erro ao salvar mensagem do usuário: %s", e)
 
-        # roteamento inicial
+        # comandos built-in
         reply = route_builtin(text)
 
-        # LLM com contexto
+        # LLM com contexto via /ai
         llm_reply = None
         if reply is None:
             tl = text.lower()
@@ -144,7 +150,7 @@ def webhook_post():
             app.logger.exception("Falha ao enviar reply: %s", e)
             replies.append({"to": number, "status": "error"})
 
-        # salvar resposta
+        # salva resposta
         try:
             salvar_mensagem(number, "assistant", prefix + reply)
         except Exception as e:
