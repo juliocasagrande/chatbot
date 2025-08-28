@@ -56,10 +56,17 @@ def webhook_post():
         key = (msg or {}).get("key", {}) or {}
         from_me = bool(key.get("fromMe"))
 
-        # SELF_TEST estrito: só processa o que VOCÊ enviou
-        if SELF_TEST == "1" and not from_me:
-            app.logger.info("SELF_TEST ativo: ignorando mensagem de terceiros.")
-            continue
+        # SELF_TEST estrito: só processa mensagens suas
+        if SELF_TEST == "1":
+            if not from_me:
+                # alguns eventos vêm com fromMe=false, mas o sender é você
+                sender_jid = ""
+                if isinstance(payload, dict):
+                    sender_jid = str(payload.get("sender") or "")
+                if only_digits(sender_jid) != only_digits(MY_NUMBER):
+                    app.logger.info("SELF_TEST ativo: ignorando mensagem de terceiros.")
+                    return jsonify({"ok": True, "got": 0, "replied": []}), 200
+
 
         text = (extract_text(msg, payload) or "").strip()
 
