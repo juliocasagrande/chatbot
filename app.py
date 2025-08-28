@@ -3,7 +3,7 @@ import os, json, logging
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from funcoes import (
-    extract_text, extract_number, route_builtin, enviar_texto, gerar_resposta_llm
+    extract_text, extract_number, route_builtin, enviar_texto, gerar_resposta_llm, only_digits
 )
 
 load_dotenv()
