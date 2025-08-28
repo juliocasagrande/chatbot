@@ -1,59 +1,23 @@
-import os, re, datetime, json, logging
+# app.py
+import os, json, logging
 from flask import Flask, request, jsonify
-import requests
 from dotenv import load_dotenv
+from funcoes import (
+    extract_text, extract_number, route_builtin, enviar_texto, gerar_resposta_llm
+)
+
 load_dotenv()
-
-# -------- Config --------
-EV_BASE = os.environ.get("EV_BASE", "").rstrip("/")
-EV_KEY  = os.environ.get("EV_KEY", "")
-EV_INST = os.environ.get("EV_INST", "")
-MY_NUMBER = os.environ.get("MY_NUMBER", "")
-SELF_TEST = os.environ.get("SELF_TEST", "0")
-
-HDRS = {"apikey": EV_KEY, "Content-Type": "application/json"}
-
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def only_digits(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
+# Env
+EV_BASE   = os.environ.get("EV_BASE", "").rstrip("/")
+EV_KEY    = os.environ.get("EV_KEY", "")
+EV_INST   = os.environ.get("EV_INST", "")
+MY_NUMBER = os.environ.get("MY_NUMBER", "")
+SELF_TEST = os.environ.get("SELF_TEST", "0")
 
-def extract_text(msg: dict) -> str | None:
-    m = msg.get("message", {}) or {}
-
-    if "conversation" in m:
-        return m["conversation"]
-    if "extendedTextMessage" in m:
-        return m["extendedTextMessage"].get("text")
-    for k in ("imageMessage", "videoMessage", "documentMessage", "audioMessage"):
-        if k in m and m[k].get("caption"):
-            return m[k]["caption"]
-    if "text" in m and isinstance(m["text"], str):
-        return m["text"]
-    if "ephemeralMessage" in m:
-        inner = m["ephemeralMessage"].get("message", {})
-        if "conversation" in inner:
-            return inner["conversation"]
-        if "extendedTextMessage" in inner:
-            return inner["extendedTextMessage"].get("text")
-    return None
-
-def route_reply(t: str) -> str | None:
-    t = (t or "").strip()
-    tl = t.lower()
-    if tl in ("ping", "/ping"): return "pong"
-    if tl in ("hora", "/hora"):
-        return "Hora: " + datetime.datetime.now().strftime("%H:%M:%S")
-    if tl in ("data", "/data"):
-        return "Data: " + datetime.datetime.now().strftime("%d/%m/%Y")
-    if tl.startswith("/eco "):  return t[5:]
-    if tl in ("ajuda", "/ajuda", "/help"):
-        return ("Comandos: ping, hora, data, /eco <texto>, ajuda\n"
-                "Obs: este bot responde apenas ao meu número 😉")
-    return f"Você disse: {t}"
-
-@app.route("/", methods=["GET"])
+@app.get("/")
 def health():
     return {
         "ok": True,
@@ -61,18 +25,19 @@ def health():
         "inst": EV_INST,
         "ev_base_set": bool(EV_BASE),
         "my_number_set": bool(MY_NUMBER),
+        "self_test": SELF_TEST,
     }, 200
 
-@app.route("/webhook", methods=["GET"])
+@app.get("/webhook")
 def webhook_get():
     return {"ok": True, "endpoint": "webhook"}, 200
 
-@app.route("/webhook", methods=["POST"])
+@app.post("/webhook")
 def webhook_post():
     payload = request.get_json(silent=True) or {}
     app.logger.info("Webhook payload: %s", json.dumps(payload)[:2000])
 
-    # receber mensagens em diferentes formatos
+    # normaliza "messages"
     messages = []
     if isinstance(payload.get("messages"), list):
         messages = payload["messages"]
@@ -88,83 +53,45 @@ def webhook_post():
     replies = []
 
     for msg in messages:
-        key = msg.get("key", {}) or {}
+        key = (msg or {}).get("key", {}) or {}
         from_me = bool(key.get("fromMe"))
-        text = extract_text(msg) or ""
 
-        # modo self-test estrito: só processa mensagens enviadas por você
+        # SELF_TEST estrito: só processa o que VOCÊ enviou
         if SELF_TEST == "1" and not from_me:
             app.logger.info("SELF_TEST ativo: ignorando mensagem de terceiros.")
             continue
 
-        # Fallback: tenta direto no envelope do Evolution (data.message)
-        if not text and isinstance(payload.get("data"), dict):
-            dm = payload["data"].get("message") or {}
-            if isinstance(dm, dict):
-                text = (
-                    dm.get("conversation")
-                    or (dm.get("extendedTextMessage") or {}).get("text")
-                    or (dm.get("imageMessage") or {}).get("caption")
-                    or (dm.get("videoMessage") or {}).get("caption")
-                    or (dm.get("documentMessage") or {}).get("caption")
-                    or ""
-                )
+        text = (extract_text(msg, payload) or "").strip()
 
-        app.logger.info("Debug texto extraído (c/ fallback): %r", text)
+        # número/remetente
+        remote, number = extract_number(msg, payload, MY_NUMBER, from_me)
+        if remote.endswith("@g.us"):
+            app.logger.info("Ignorando grupo: %s", remote);  continue
+        if MY_NUMBER and number != (''.join(filter(str.isdigit, MY_NUMBER))):
+            app.logger.info("Ignorando %s (não é MY_NUMBER)", number);  continue
 
-        # ignora mensagens do próprio bot, a menos que SELF_TEST esteja ativado
-        if from_me:
-            if SELF_TEST != "1":
-                continue
-            if text.lower().startswith("[bot]"):
-                continue
+        # roteamento: comandos built-in primeiro
+        reply = route_builtin(text)
 
-        # --- extração robusta do número ---
-        remote = (
-            key.get("remoteJid")
-            or key.get("participant")
-            or msg.get("from")
-            or (payload.get("sender") if isinstance(payload, dict) else "")
-            or ""
-        )
+        # comando LLM: /ai <texto> (só chama a Groq quando solicitado)
+        if reply is None:
+            tl = text.lower()
+            if tl.startswith("/ai "):
+                prompt = text[4:].strip()
+                if not prompt:
+                    reply = "Use assim: /ai sua pergunta aqui."
+                else:
+                    reply = gerar_resposta_llm(prompt, system="Você é um assistente do WhatsApp útil e conciso.")
+            else:
+                # fallback simples:
+                reply = f"Você disse: {text}"
 
-        if not remote and isinstance(payload.get("data"), dict):
-            d = payload["data"]
-            remote = d.get("sender") or d.get("from") or d.get("remoteJid") or ""
-
-        number = only_digits(remote)
-
-        if isinstance(remote, str) and remote.endswith("@g.us"):
-            app.logger.info("Ignorando mensagem de grupo: %s", remote)
-            continue
-
-        if from_me and not number:
-            number = only_digits(MY_NUMBER)
-
-        app.logger.info("Debug número - remote: %r -> number extraído: %r ; MY_NUMBER: %r",
-                        remote, number, only_digits(MY_NUMBER))
-
-        if MY_NUMBER and number != only_digits(MY_NUMBER):
-            app.logger.info("Ignorando mensagem de %s (não é MY_NUMBER)", number)
-            continue
-
-        reply = route_reply(text)
-        if not reply:
-            continue
-
+        # prefixo anti-loop para mensagens enviadas por você
         prefix = "[bot] " if from_me else ""
-        body = {"number": number, "text": prefix + reply}
-        url = f"{EV_BASE}/message/sendText/{EV_INST}"
+        r = enviar_texto(EV_BASE, EV_KEY, EV_INST, number, prefix + reply)
+        replies.append({"to": number, "status": getattr(r, "status_code", "NA")})
 
-        try:
-            r = requests.post(url, headers=HDRS, json=body, timeout=15)
-            app.logger.info("Envio reply -> %s [%s]: %s", number, r.status_code, r.text[:300])
-            replies.append({"to": number, "status": r.status_code})
-        except Exception as e:
-            app.logger.exception("Falha ao enviar reply para %s: %s", number, e)
-            replies.append({"to": number, "status": "error", "err": str(e)})
-
-    return jsonify({"ok": True, "got": len(messages), "replied": replies})
+    return jsonify({"ok": True, "got": len(messages), "replied": replies}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
